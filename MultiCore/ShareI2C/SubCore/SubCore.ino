@@ -18,105 +18,12 @@
  */
  
 #include <MP.h>
-#include <cxd56_i2c.h>
-#include <Wire.h>
+#include <Adafruit_BMP280.h>
+
+Adafruit_BMP280 bmp; // use I2C interface
 
 #define MSG_REQ_BMP   1
 #define MSG_RET_BMP   2
-
-#define BMP_ADDR        0x76
-#define REG_ID          0xD0
-#define REG_RESET       0xE0
-#define REG_CTRL_MEAS   0xF4
-#define REG_CONFIG      0xF5
-#define REG_PRESS_MSB   0xF7
-
-// ------------------------------------------------------
-// I2C Write Helper
-// ------------------------------------------------------
-bool bmp_write_reg(uint8_t reg, uint8_t value)
-{
-  Wire.beginTransmission(BMP_ADDR);
-  Wire.write(reg);
-  Wire.write(value);
-  return (Wire.endTransmission() == 0);
-}
-
-// ------------------------------------------------------
-// I2C Read Helper
-// ------------------------------------------------------
-bool bmp_read_bytes(uint8_t reg, uint8_t *buf, uint8_t len)
-{
-  Wire.beginTransmission(BMP_ADDR);
-  Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) {
-    Serial.printf("[SUB] Write reg 0x%02X failed\n", reg);
-    return false;
-  }
-
-  if (Wire.requestFrom(BMP_ADDR, len) != len) {
-    Serial.printf("[SUB] Read reg 0x%02X failed\n", reg);
-    return false;
-  }
-
-  for (uint8_t i = 0; i < len; i++) {
-    buf[i] = Wire.read();
-  }
-  return true;
-}
-
-// ------------------------------------------------------
-// BMP280 Init
-// ------------------------------------------------------
-bool bmp_init_raw()
-{
-  Wire.begin();
-  Wire.setClock(400000);
-  delay(10);
-
-  uint8_t id = 0;
-  if (!bmp_read_bytes(REG_ID, &id, 1)) {
-    Serial.println("[SUB] ID read fail");
-    return false;
-  }
-
-  Serial.printf("[SUB] BMP ID=0x%02X\n", id);
-
-  // Soft reset
-  bmp_write_reg(REG_RESET, 0xB6);
-  delay(200);
-
-  if (!bmp_read_bytes(REG_ID, &id, 1)) {
-    Serial.println("[SUB] ID read after reset fail");
-  } else {
-    Serial.printf("[SUB] BMP ID(after reset)=0x%02X\n", id);
-  }
-
-  bmp_write_reg(REG_CONFIG, 0x10);
-  bmp_write_reg(REG_CTRL_MEAS, 0x27);
-  delay(50);
-
-  Serial.println("[SUB] BMP RAW init OK");
-  return true;
-}
-
-// ------------------------------------------------------
-// Read raw 20-bit pressure
-// ------------------------------------------------------
-int32_t bmp_read_raw_pressure()
-{
-  uint8_t buf[3];
-  if (!bmp_read_bytes(REG_PRESS_MSB, buf, 3)) {
-    return -1;
-  }
-
-  uint32_t raw =
-    ((uint32_t)buf[0] << 12) |
-    ((uint32_t)buf[1] << 4 ) |
-    ((uint32_t)buf[2] >> 4);
-
-  return (int32_t)raw;
-}
 
 // ------------------------------------------------------
 // Setup
@@ -126,9 +33,30 @@ void setup()
   Serial.begin(115200);
   while (!Serial);
 
-  Serial.println("== SubCore BMP280 RAW HAL Mode ==");
+  unsigned status = bmp.begin(0x76);
+  if (!status) {
+    Serial.println(F("Could not find a valid BMP280 sensor, check wiring or "
+                      "try a different address!"));
+    Serial.print("SensorID was: 0x"); Serial.println(bmp.sensorID(),16);
+    Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
+    Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
+    Serial.print("        ID of 0x60 represents a BME 280.\n");
+    Serial.print("        ID of 0x61 represents a BME 680.\n");
+    while (1) delay(10);
+  }
+
+  /* Default settings from datasheet. */
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
+                  Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
+                  Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                  Adafruit_BMP280::FILTER_X16,      /* Filtering. */
+                  Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+
+  up_disable_irq(CXD56_IRQ_SCU_I2C0);
+
   MP.begin();
   MP.RecvTimeout(3000);
+
 }
 
 // ------------------------------------------------------
@@ -141,21 +69,25 @@ void loop()
 
   if (MP.Recv(&msgid, &dummy) >= 0 && msgid == MSG_REQ_BMP) {
 
-    if (!bmp_init_raw()) {
-      Serial.println("[SUB] bmp_init_raw failed");
-    }
+    up_enable_irq(CXD56_IRQ_SCU_I2C0);
 
-    int32_t raw = bmp_read_raw_pressure();
+    Serial.print(F("[Sub] Temperature = "));
+    Serial.print(bmp.readTemperature());
+    Serial.println(" *C");
 
-    if (raw < 0) {
-      Serial.println("[SUB] RAW read fail");
-      Wire.end();
-    } else {
-      float hpa = (raw / 256.0f) / 1.33f;
-      Serial.printf("[SUB] RAW=%ld  →  ~%.2f hPa\n", (long)raw, hpa);
-      Wire.end();
-      MP.Send(MSG_RET_BMP, hpa);
-    }
+    Serial.print(F("[Sub] Pressure = "));
+    Serial.print(bmp.readPressure());
+    Serial.println(" Pa");
+
+    Serial.print(F("[Sub] Approx altitude = "));
+    Serial.print(bmp.readAltitude(1013.25)); /* Adjusted to local forecast! */
+    Serial.println(" m");
+    Serial.flush();
+
+    float hpa = bmp.readTemperature();
+
+    up_disable_irq(CXD56_IRQ_SCU_I2C0);
+    MP.Send(MSG_RET_BMP, hpa);
 
   } else {
     Serial.println("[Sub] recv timeout");
