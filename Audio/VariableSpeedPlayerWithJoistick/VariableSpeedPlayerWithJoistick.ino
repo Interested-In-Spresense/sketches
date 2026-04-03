@@ -1,6 +1,8 @@
 /*
  *  VariableSpeedPlayer.ino - A variable-speed audio player sample with Analog Joistick
- *  
+ *
+ *  Based on Spresense.ino from
+ *  https://github.com/Interested-In-Spresense/sketches/tree/master/Audio/VariableSpeedPlayer
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public

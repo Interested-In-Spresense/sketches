@@ -1,6 +1,8 @@
 /*
  *  VariableSpeedPlayer.ino - A variable-speed audio player sample
- *  
+ *
+ *  Based on Spresense.ino from
+ *  https://github.com/SonySemiconductorSolutions/spresense-arduino-compatible/blob/new-master/Arduino15/packages/SPRESENSE/hardware/spresense/1.0.0/libraries/Audio/examples/application/rendering_objif/rendering_objif.ino
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public

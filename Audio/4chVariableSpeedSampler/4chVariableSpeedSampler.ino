@@ -1,9 +1,10 @@
 /*  
- *  4chSampler.ino - 4 channel sampler application
+ *  4chVariableSpeedSampler.ino - 4 channel variable-speed sampler sample
  *  Author Interested-In-Spresense
  *
  *  Based on Spresense.ino from
- *  https://github.com/SonySemiconductorSolutions/spresense-arduino-compatible/blob/new-master/Arduino15/packages/SPRESENSE/hardware/spresense/1.0.0/libraries/Audio/examples/application/rendering_objif/rendering_objif.ino
+ *  https://github.com/Interested-In-Spresense/sketches/blob/master/Audio/4chSampler/4chSampler.ino
+ *  https://github.com/Interested-In-Spresense/sketches/tree/master/Audio/VariableSpeedPlayer
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -53,9 +54,21 @@ OutputMixer *theMixer;
 
 static File     g_file[SLOTS];
 static bool     g_active[SLOTS] = { false, false, false, false };
+static int8_t   g_fileno[SLOTS] = { -1, -1, -1, -1 };
 
 static uint32_t g_tick = 1;
 static uint32_t g_last_tick[SLOTS] = { 0, 0, 0, 0 };
+
+/* Variable speed control */
+static float g_speed[SLOTS] = {1.0f, 1.0f, 1.0f, 1.0f};
+static float g_phase[SLOTS] = {0.0f, 0.0f, 0.0f, 0.0f};
+static int16_t g_prev[SLOTS] = {0, 0, 0, 0};
+static int16_t g_resampled[READSAMPLE * 2];
+#define SPEED_STEP (0.02f)
+
+static char     g_cmd_buf[8] = { 0 };
+static uint8_t  g_cmd_len = 0;
+static uint32_t g_cmd_started_ms = 0;
 
 /* Shared read buffer (single-thread loop usage) */
 static uint8_t g_mono[READSAMPLE * 2]; // 480 bytes
@@ -269,6 +282,116 @@ static inline bool getFrame1(AsPcmDataParam *pcm, int32_t identifier)
   return getFrame(pcm, 1, S0_REND_PCM_SUB_BUF_POOL, identifier);
 }
 
+static void reset_slot_params(int slot)
+{
+  g_speed[slot] = 1.0f;
+  g_phase[slot] = 0.0f;
+  g_prev[slot] = 0;
+  g_fileno[slot] = -1;
+}
+
+static void clear_command_buffer(void)
+{
+  g_cmd_len = 0;
+  g_cmd_buf[0] = '\0';
+  g_cmd_started_ms = 0;
+}
+
+static void change_speed_by_fileno(uint8_t fileno, float delta)
+{
+  bool found = false;
+
+  for (int slot = 0; slot < SLOTS; slot++) {
+    if (!g_active[slot] || g_fileno[slot] != (int8_t)fileno) continue;
+
+    g_speed[slot] += delta;
+    if (g_speed[slot] > 2.0f) g_speed[slot] = 2.0f;
+    if (g_speed[slot] < 0.5f) g_speed[slot] = 0.5f;
+    printf("sound%u speed %.2f\n", (unsigned)fileno, g_speed[slot]);
+    found = true;
+  }
+
+  if (!found) {
+    printf("sound%u is not active\n", (unsigned)fileno);
+  }
+}
+
+static void process_command_buffer(void)
+{
+  if (g_cmd_len == 0) return;
+
+  if (g_cmd_len == 1) {
+    char c = g_cmd_buf[0];
+
+    if (c >= '0' && c <= '9') {
+      uint8_t fileno = (uint8_t)(c - '0');
+      (void)start(fileno);
+      clear_command_buffer();
+      return;
+    }
+
+    if (c == 's') {
+      if (s_state == Active) {
+        stop();
+      }
+      s_state = Stopping;
+      clear_command_buffer();
+      return;
+    }
+  }
+
+  if (g_cmd_len == 2 && g_cmd_buf[0] >= '0' && g_cmd_buf[0] <= '9') {
+    uint8_t fileno = (uint8_t)(g_cmd_buf[0] - '0');
+
+    if (g_cmd_buf[1] == '+') {
+      change_speed_by_fileno(fileno, SPEED_STEP);
+      clear_command_buffer();
+      return;
+    }
+
+    if (g_cmd_buf[1] == '-') {
+      change_speed_by_fileno(fileno, -SPEED_STEP);
+      clear_command_buffer();
+      return;
+    }
+  }
+
+  printf("unknown cmd: %s\n", g_cmd_buf);
+  clear_command_buffer();
+}
+
+/* Monoized fractional resampling for variable speed */
+static int fractional_resample_mono(int16_t *in, int16_t *out, int in_samples, float ratio, int slot)
+{
+  if (in_samples <= 0) return 0;
+  int out_samples = 0;
+  float x = g_phase[slot];
+  
+  while (x < (float)in_samples - 1) {
+    int n = (int)x;
+    float t = x - n;
+    
+    int16_t s0, s1;
+    if (n < 0) {
+      s0 = g_prev[slot];
+      s1 = in[0];
+    } else {
+      s0 = in[n];
+      s1 = in[n+1];
+    }
+    
+    out[out_samples] = (int16_t)((1.0f - t)*s0 + t*s1);
+    out_samples++;
+    x += ratio;
+  }
+  
+  x -= (float)in_samples;
+  g_phase[slot] = x;
+  g_prev[slot] = in[in_samples - 1];
+  
+  return out_samples;
+}
+
 /* ---------------- Slot IO ---------------- */
 // push mono into slot's mixer/channel (EOF handled here)
 static int32_t pushBridgeBuffer(int slot)
@@ -301,7 +424,15 @@ static int32_t pushBridgeBuffer(int slot)
   }
 
   const int16_t* in = (const int16_t*)g_mono;
-  int32_t w = g_buf[mix].write_samples(ch, in, READSAMPLE);
+  int32_t samples_to_write = READSAMPLE;
+  
+  // Apply variable speed resampling if speed != 1.0
+  if (g_speed[slot] != 1.0f) {
+    samples_to_write = fractional_resample_mono((int16_t*)g_mono, g_resampled, READSAMPLE, 1.0f / g_speed[slot], slot);
+    in = g_resampled;
+  }
+  
+  int32_t w = g_buf[mix].write_samples(ch, in, samples_to_write);
   if (w > 0) {
     g_last_tick[slot] = g_tick++;
   }
@@ -316,6 +447,7 @@ static void stop_slot(int slot)
   if (g_file[slot]) g_file[slot].close();
   g_active[slot] = false;
   g_last_tick[slot] = 0;
+  reset_slot_params(slot);
   g_buf[mix].detach(ch);
 }
 
@@ -369,6 +501,8 @@ static bool start_sound(uint8_t fileno)
 
   g_buf[mix].attach(ch);
   g_active[slot] = true;
+  reset_slot_params(slot);
+  g_fileno[slot] = (int8_t)fileno;
   g_last_tick[slot] = g_tick++;
 
   // preload Three frames for this slot
@@ -398,6 +532,7 @@ static bool start(uint8_t fileno)
       if (g_file[slot]) g_file[slot].close();
       g_active[slot] = false;
       g_last_tick[slot] = 0;
+      reset_slot_params(slot);
       int mix = slot_to_mixer(slot);
       int ch  = slot_to_ch(slot);
       g_buf[mix].detach(ch);
@@ -465,6 +600,7 @@ static void stop(void)
     if (g_file[slot]) g_file[slot].close();
     g_active[slot] = false;
     g_last_tick[slot] = 0;
+    reset_slot_params(slot);
     int mix = slot_to_mixer(slot);
     int ch  = slot_to_ch(slot);
     g_buf[mix].detach(ch);
@@ -563,6 +699,7 @@ void setup()
   theMixer->setVolume(-16, -16, -16);
   board_external_amp_mute_control(false);
 
+  puts("commands: 0-9 play, 0+..9+ speed up, 0-..9- speed down, s stop");
   printf("setup() complete\n");
 }
 
@@ -573,29 +710,45 @@ void loop()
     goto stop_rendering;
   }
 
-  // Menu operation
-  if (Serial.available() > 0)
+  while (Serial.available() > 0)
   {
     char c = (char)Serial.read();
 
-    // 0-9: play sound0.raw ... sound9.raw
-    if (c >= '0' && c <= '9') {
-      uint8_t fileno = (uint8_t)(c - '0');
-      (void)start(fileno);
+    if (c == '\r') {
+      continue;
     }
-    else {
-      switch (c) {
-        case 's': // stop (Mixer stop)
-          if (s_state == Active) {
-            stop();
-          }
-          s_state = Stopping;
-          break;
 
-        default:
-          break;
-      }
+    if (c == '\n') {
+      process_command_buffer();
+      continue;
     }
+
+    if (g_cmd_len == 0) {
+      g_cmd_started_ms = millis();
+    }
+
+    if (g_cmd_len < sizeof(g_cmd_buf) - 1) {
+      g_cmd_buf[g_cmd_len++] = c;
+      g_cmd_buf[g_cmd_len] = '\0';
+    } else {
+      process_command_buffer();
+      continue;
+    }
+
+    if (g_cmd_len == 1 && c == 's') {
+      process_command_buffer();
+      continue;
+    }
+
+    if (g_cmd_len == 2 && g_cmd_buf[0] >= '0' && g_cmd_buf[0] <= '9'
+        && (g_cmd_buf[1] == '+' || g_cmd_buf[1] == '-')) {
+      process_command_buffer();
+    }
+  }
+
+  if (g_cmd_len == 1 && g_cmd_buf[0] >= '0' && g_cmd_buf[0] <= '9'
+      && (millis() - g_cmd_started_ms) > 250) {
+    process_command_buffer();
   }
 
   switch (s_state) {
@@ -635,3 +788,5 @@ stop_rendering:
   puts("Exit Rendering");
   exit(1);
 }
+
+
