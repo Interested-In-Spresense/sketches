@@ -1,4 +1,4 @@
-/*
+﻿/*
  *  Bmi160Core.ino - BMI160 sensor core for ManySensor.
  *  Author Interested-In-Spresense
  *
@@ -23,21 +23,42 @@
 
 #include <MP.h>
 #include <BMI160Gen.h>
+#include "ManySensorShared.h"
 
-#define MSG_REQ_BMI   3
-#define MSG_RET_BMI   4
+static constexpr float BMI_ACC_G_TO_MPS2 = 9.80665f;
+static constexpr float BMI_GYRO_DPS_TO_RADPS = 0.01745329252f;
+
+static float *g_data = NULL;  /* [ax, ay, az] / [gx, gy, gz] / [ax, ay, az, gx, gy, gz] */
+static SensorState g_state = SENSOR_STATE_READY;
+static uint32_t g_mode = BMI160_MODE_ACC;
+
+static void convertAccelToMps2(float &ax, float &ay, float &az)
+{
+  ax *= BMI_ACC_G_TO_MPS2;
+  ay *= BMI_ACC_G_TO_MPS2;
+  az *= BMI_ACC_G_TO_MPS2;
+}
+
+static void convertGyroToRadps(float &gx, float &gy, float &gz)
+{
+  gx *= BMI_GYRO_DPS_TO_RADPS;
+  gy *= BMI_GYRO_DPS_TO_RADPS;
+  gz *= BMI_GYRO_DPS_TO_RADPS;
+}
+
+static void haltOnError(int32_t errCode)
+{
+  (void)errCode;
+  while (1) {
+    delay(1000);
+  }
+}
 
 // ------------------------------------------------------------
 // SETUP
 // ------------------------------------------------------------
 void setup() {
-  Serial.begin(115200);
-  while (!Serial);
-
-  // initialize device
   BMI160.begin();
-
-  // Set the accelerometer range to 2G
   BMI160.setAccelerometerRange(2);
   up_disable_irq(CXD56_IRQ_SCU_I2C0);
 
@@ -51,31 +72,85 @@ void setup() {
 void loop() {
 
   int8_t msgid;
-  uint32_t dummy;
+  uint32_t phys_addr;
 
-  if (MP.Recv(&msgid, &dummy) >= 0 && msgid == MSG_REQ_BMI) {
+  /* Receive shared address on first call */
+  if (!g_data) {
+    int ret = MP.Recv(&msgid, &phys_addr, 0);
+    if (ret < 0 || msgid != MSG_SET_SHARED_BMI) {
+      delay(100);
+      return;
+    }
+    g_data = reinterpret_cast<float *>(phys_addr);
+  }
 
-    float ax, ay, az;   //scaled accelerometer values
+  /* Wait for measurement request */
+  int ret = MP.Recv(&msgid, &phys_addr, 0);
 
-    up_enable_irq(CXD56_IRQ_SCU_I2C0);
+  if (ret < 0) {
+    haltOnError(SENSOR_ERR_BMI_RECV_FAILED);
+  }
 
-    // read accelerometer measurements from device, scaled to the configured range
+  switch (msgid) {
+  case MSG_SET_SHARED_BMI:
+    g_data = reinterpret_cast<float *>(phys_addr);
+    return;
+
+  case MSG_SENSOR_STOP:
+    g_state = SENSOR_STATE_READY;
+    MP.Send(MSG_RET_STATE, SENSOR_ERROR_OK);
+    return;
+
+  case MSG_SENSOR_START:
+    g_state = SENSOR_STATE_RUN;
+    g_mode = (uint32_t)phys_addr;  /* phys_addr carries BMI160 mode */
+    MP.Send(MSG_RET_STATE, SENSOR_ERROR_OK);
+    return;
+
+  case MSG_REQ_BMI:
+    if (g_state != SENSOR_STATE_RUN) {
+      /* Sensor not running: ignore this request */
+      return;
+    }
+    break;
+
+  default:
+    haltOnError(SENSOR_ERR_BMI_UNEXPECTED_MSG);
+  }
+
+  /* Read sensor and write to shared memory based on selected mode */
+  float ax, ay, az;
+  float gx, gy, gz;
+
+  up_enable_irq(CXD56_IRQ_SCU_I2C0);
+  if (g_mode == BMI160_MODE_ACC) {
     BMI160.readAccelerometerScaled(ax, ay, az);
-
-    // display tab-separated accelerometer x/y/z values
-    Serial.print("[Sub2] acc:\t");
-    Serial.print(ax);
-    Serial.print("\t");
-    Serial.print(ay);
-    Serial.print("\t");
-    Serial.print(az);
-    Serial.println();
-    Serial.flush();
-
-    up_disable_irq(CXD56_IRQ_SCU_I2C0);
-    MP.Send(MSG_RET_BMI, (uint32_t)0);
-
+    convertAccelToMps2(ax, ay, az);
+    g_data[0] = ax;
+    g_data[1] = ay;
+    g_data[2] = az;
+  } else if (g_mode == BMI160_MODE_GYRO) {
+    BMI160.readGyroScaled(gx, gy, gz);
+    convertGyroToRadps(gx, gy, gz);
+    g_data[0] = gx;
+    g_data[1] = gy;
+    g_data[2] = gz;
   } else {
-    Serial.println("[Sub2] recv timeout");
+    BMI160.readAccelerometerScaled(ax, ay, az);
+    BMI160.readGyroScaled(gx, gy, gz);
+    convertAccelToMps2(ax, ay, az);
+    convertGyroToRadps(gx, gy, gz);
+    g_data[0] = ax;
+    g_data[1] = ay;
+    g_data[2] = az;
+    g_data[3] = gx;
+    g_data[4] = gy;
+    g_data[5] = gz;
+  }
+  up_disable_irq(CXD56_IRQ_SCU_I2C0);
+
+  /* Send reply */
+  if (MP.Send(MSG_RET_BMI, SENSOR_ERROR_OK) < 0) {
+    haltOnError(SENSOR_ERR_BMI_REPLY_SEND_FAILED);
   }
 }

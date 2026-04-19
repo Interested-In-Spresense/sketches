@@ -1,5 +1,5 @@
-/*
- *  Bmp280Core.ino - BMP280 subcore responder for ManySensor.
+﻿/*
+ *  Bmp280Core.ino - BMP280 sensor core for ManySensor.
  *  Author Interested-In-Spresense
  *
  *  This library is free software; you can redistribute it and/or
@@ -23,44 +23,42 @@
 
 #include <MP.h>
 #include <Adafruit_BMP280.h>
+#include "ManySensorShared.h"
 
 Adafruit_BMP280 bmp; // use I2C interface
 
-#define MSG_REQ_BMP   1
-#define MSG_RET_BMP   2
+static float *g_data = NULL;  /* [temp_c, pressure_pa, altitude_m] or [pressure_pa] */
+static uint32_t g_state = SENSOR_STATE_READY;
+static uint32_t g_mode = BMP280_MODE_FULL;
+
+static void haltOnError(int32_t errCode)
+{
+  (void)errCode;
+  while (1) {
+    delay(1000);
+  }
+}
 
 // ------------------------------------------------------
 // Setup
 // ------------------------------------------------------
 void setup()
 {
-  Serial.begin(115200);
-  while (!Serial);
-
   unsigned status = bmp.begin(0x76);
   if (!status) {
-    Serial.println(F("Could not find a valid BMP280 sensor, check wiring or "
-                      "try a different address!"));
-    Serial.print("SensorID was: 0x"); Serial.println(bmp.sensorID(),16);
-    Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
-    Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
-    Serial.print("        ID of 0x60 represents a BME 280.\n");
-    Serial.print("        ID of 0x61 represents a BME 680.\n");
-    while (1) delay(10);
+    haltOnError(SENSOR_ERR_BMP_BEGIN_FAILED);
   }
 
-  /* Default settings from datasheet. */
-  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
-                  Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
-                  Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
-                  Adafruit_BMP280::FILTER_X16,      /* Filtering. */
-                  Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                  Adafruit_BMP280::SAMPLING_X2,
+                  Adafruit_BMP280::SAMPLING_X16,
+                  Adafruit_BMP280::FILTER_X16,
+                  Adafruit_BMP280::STANDBY_MS_500);
 
   up_disable_irq(CXD56_IRQ_SCU_I2C0);
 
   MP.begin();
   MP.RecvTimeout(3000);
-
 }
 
 // ------------------------------------------------------
@@ -69,32 +67,72 @@ void setup()
 void loop()
 {
   int8_t msgid;
-  uint32_t dummy;
+  uint32_t phys_addr;
 
-  if (MP.Recv(&msgid, &dummy) >= 0 && msgid == MSG_REQ_BMP) {
-
-    up_enable_irq(CXD56_IRQ_SCU_I2C0);
-
-    Serial.print(F("[Sub] Temperature = "));
-    Serial.print(bmp.readTemperature());
-    Serial.println(" *C");
-
-    Serial.print(F("[Sub] Pressure = "));
-    Serial.print(bmp.readPressure());
-    Serial.println(" Pa");
-
-    Serial.print(F("[Sub] Approx altitude = "));
-    Serial.print(bmp.readAltitude(1013.25)); /* Adjusted to local forecast! */
-    Serial.println(" m");
-    Serial.flush();
-
-    float hpa = bmp.readTemperature();
-
-    up_disable_irq(CXD56_IRQ_SCU_I2C0);
-    MP.Send(MSG_RET_BMP, hpa);
-
-  } else {
-    Serial.println("[Sub] recv timeout");
+  /* Receive shared address on first call */
+  if (!g_data) {
+    int ret = MP.Recv(&msgid, &phys_addr, 0);
+    if (ret < 0 || msgid != MSG_SET_SHARED_BMP) {
+      delay(100);
+      return;
+    }
+    g_data = reinterpret_cast<float *>(phys_addr);
   }
 
+  /* Wait for measurement request */
+  int ret = MP.Recv(&msgid, &phys_addr, 0);
+  if (ret < 0) {
+    haltOnError(SENSOR_ERR_BMP_RECV_FAILED);
+  }
+
+  switch (msgid) {
+  case MSG_SET_SHARED_BMP:
+    g_data = reinterpret_cast<float *>(phys_addr);
+    return;
+
+  case MSG_SENSOR_STOP:
+    g_state = SENSOR_STATE_READY;
+    if (MP.Send(MSG_RET_STATE, SENSOR_ERROR_OK) < 0) {
+      haltOnError(SENSOR_ERR_BMP_REPLY_SEND_FAILED);
+    }
+    return;
+
+  case MSG_SENSOR_START:
+    g_state = SENSOR_STATE_RUN;
+    g_mode = (uint32_t)phys_addr;  /* phys_addr carries BMP280 mode */
+    if (MP.Send(MSG_RET_STATE, SENSOR_ERROR_OK) < 0) {
+      haltOnError(SENSOR_ERR_BMP_REPLY_SEND_FAILED);
+    }
+    return;
+
+  case MSG_REQ_BMP:
+    if (g_state != SENSOR_STATE_RUN) {
+      /* Sensor not running: ignore this request */
+      return;
+    }
+    break;
+
+  default:
+    haltOnError(SENSOR_ERR_BMP_UNEXPECTED_MSG);
+  }
+
+  /* Read sensor and write to shared memory */
+  up_enable_irq(CXD56_IRQ_SCU_I2C0);
+
+  if (g_mode == BMP280_MODE_FULL) {
+    /* Write: temperature, pressure, altitude */
+    g_data[0] = bmp.readTemperature();
+    g_data[1] = bmp.readPressure();
+    g_data[2] = bmp.readAltitude(1013.25);
+  } else {
+    /* Write: pressure only */
+    g_data[0] = bmp.readPressure();
+  }
+
+  up_disable_irq(CXD56_IRQ_SCU_I2C0);
+
+  /* Send reply */
+  if (MP.Send(MSG_RET_BMP, SENSOR_ERROR_OK) < 0) {
+    haltOnError(SENSOR_ERR_BMP_REPLY_SEND_FAILED);
+  }
 }
