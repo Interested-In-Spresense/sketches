@@ -24,9 +24,12 @@
 #include <Arduino.h>
 #include <MP.h>
 #include "ManySensorShared.h"
-#include "SharedMemoryAllocator.h"
+#include "SharedMemoryConfig.h"
+#include <MultiCoreSpinLock.h>
+#include <SharedMemoryAllocator.h>
 
 static SharedMemoryRegion g_shared_memory = {
+  { NULL, sizeof(MultiCoreSpinLock), 1, NULL, 0 },
   { NULL, BMP280_DATA_LEN * sizeof(float), 0, NULL, 0 },
   { NULL, BMI160_DATA_LEN * sizeof(float), 0, NULL, 0 },
   { NULL, MULTIMU_DATA_LEN * sizeof(float), 0, NULL, 0 },
@@ -37,10 +40,31 @@ constexpr uint32_t READY_HOLD_MS = 300;
 static uint32_t g_bmp_mode = BMP280_MODE_FULL;
 static uint32_t g_bmi_mode = BMI160_MODE_ACC;
 static uint32_t g_mimu_mode = MIMU_MODE_DATA;
-static SharedMemoryLayout g_active_layout = SHARED_LAYOUT_0;
+static SharedMemoryLayout g_active_layout = SHARED_LAYOUT_2;
+static MultiCoreSpinLock *g_i2c_lock = NULL;
 
-static ShardMemoryAllocator g_allocator;
+static SharedMemoryAllocator theAllocator;
 static bool sendAllSharedAddresses(const SharedMemoryRegion &region);
+
+static bool waitSubcoreReady(int subid, const char *name)
+{
+  int8_t msgid = 0;
+  uint32_t value = 0;
+  int ret = MP.Recv(&msgid, &value, subid);
+  if (ret < 0) {
+    Serial.print("[Main] READY timeout from ");
+    Serial.println(name);
+    return false;
+  }
+  if (msgid != MSG_SUBCORE_READY) {
+    Serial.print("[Main] unexpected startup msg from ");
+    Serial.print(name);
+    Serial.print(": msgid=");
+    Serial.println(msgid);
+    return false;
+  }
+  return true;
+}
 
 enum MainState {
   MAIN_STATE_RUN = 0,
@@ -48,6 +72,48 @@ enum MainState {
 };
 
 namespace {
+
+void printLayoutAreaInfo(const char *name, const SharedLayoutArea &area)
+{
+  Serial.print("[Main]   ");
+  Serial.print(name);
+  Serial.print(": size=");
+  Serial.print((unsigned long)area.size);
+  Serial.print(" count=");
+  Serial.print((unsigned long)area.count);
+  Serial.print(" total=");
+  Serial.println((unsigned long)(area.size * area.count));
+}
+
+void printLayoutRequest(SharedMemoryLayout layout)
+{
+  Serial.print("[Main] configure request: ");
+  Serial.println(layoutNameString[layout]);
+  printLayoutAreaInfo("spinlock", sharedLayouts[layout].areas[0]);
+  printLayoutAreaInfo("bmp", sharedLayouts[layout].areas[1]);
+  printLayoutAreaInfo("bmi", sharedLayouts[layout].areas[2]);
+  printLayoutAreaInfo("mimu", sharedLayouts[layout].areas[3]);
+}
+
+void printRegionState(const SharedMemoryRegion &region)
+{
+  Serial.print("[Main]   region spinlock data=");
+  Serial.print((uintptr_t)region.spinlock.data, HEX);
+  Serial.print(" total_bytes=");
+  Serial.println((unsigned long)region.spinlock.total_bytes);
+  Serial.print("[Main]   region bmp data=");
+  Serial.print((uintptr_t)region.bmp.data, HEX);
+  Serial.print(" total_bytes=");
+  Serial.println((unsigned long)region.bmp.total_bytes);
+  Serial.print("[Main]   region bmi data=");
+  Serial.print((uintptr_t)region.bmi.data, HEX);
+  Serial.print(" total_bytes=");
+  Serial.println((unsigned long)region.bmi.total_bytes);
+  Serial.print("[Main]   region mimu data=");
+  Serial.print((uintptr_t)region.mimu.data, HEX);
+  Serial.print(" total_bytes=");
+  Serial.println((unsigned long)region.mimu.total_bytes);
+}
 
 void applyModesForLayout(SharedMemoryLayout layout)
 {
@@ -163,70 +229,39 @@ void printMIMU(const float *mimuData)
   }
 }
 
-bool waitStateAckFromCore(int coreId, const char *coreName)
-{
-  int8_t ackMsgid;
-  uint32_t ackValue;
-
-  for (int i = 0; i < 4; ++i) {
-    int ret = MP.Recv(&ackMsgid, &ackValue, coreId);
-    if (ret < 0) {
-      Serial.print("[Main] ACK timeout from ");
-      Serial.println(coreName);
-      return false;
-    }
-    if (ackMsgid == MSG_RET_STATE) {
-      return true;
-    }
-
-    /* Drop stale replies (e.g. delayed MSG_RET_BMP/MSG_RET_BMI/MSG_RET_MIMU) */
-    Serial.print("[Main] Dropped stale msg from ");
-    Serial.print(coreName);
-    Serial.print(": msgid=");
-    Serial.print(ackMsgid);
-    Serial.print(" value=");
-    Serial.println(ackValue);
-  }
-
-  Serial.print("[Main] ACK not received from ");
-  Serial.println(coreName);
-  return false;
-}
-
-void drainPendingFromCore(int coreId, const char *coreName)
-{
-  int8_t msgid;
-  uint32_t value;
-
-  /* Temporarily shorten timeout to flush queued messages without long blocking */
-  MP.RecvTimeout(10);
-  for (int i = 0; i < 8; ++i) {
-    if (MP.Recv(&msgid, &value, coreId) < 0) {
-      break;
-    }
-    Serial.print("[Main] Drained pending msg from ");
-    Serial.print(coreName);
-    Serial.print(": msgid=");
-    Serial.print(msgid);
-    Serial.print(" value=");
-    Serial.println(value);
-  }
-  MP.RecvTimeout(3000);
-}
-
 bool configureSharedLayout(SharedMemoryLayout layout)
 {
-  if (g_allocator.isAllocated(g_shared_memory)) {
-    if (!g_allocator.free(&g_shared_memory)) {
+  printLayoutRequest(layout);
+  Serial.print("[Main] allocator currently allocated=");
+  Serial.println(theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT) ? "yes" : "no");
+
+  if (theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
+    Serial.println("[Main] freeing previous shared layout");
+    if (!theAllocator.free(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
       Serial.println("[Main] shared memory fence check failed during layout switch");
+    } else {
+      Serial.println("[Main] previous shared layout freed");
     }
   }
 
-  if (!g_allocator.alloc(layout, &g_shared_memory)) {
+  if (!theAllocator.alloc(sharedLayouts[layout].areas, SHARED_AREA_COUNT, regionAreas(&g_shared_memory))) {
     Serial.print("[Main] shared memory allocation failed: layout=");
     Serial.println(layoutNameString[layout]);
+    printRegionState(g_shared_memory);
     return false;
   }
+
+  g_i2c_lock = static_cast<MultiCoreSpinLock *>(g_shared_memory.spinlock.data);
+  if (!g_i2c_lock) {
+    Serial.println("[Main] spinlock allocation returned null");
+    return false;
+  }
+  MultiCoreSpin::init(g_i2c_lock);
+  Serial.print("[Main] i2c spinlock ready at 0x");
+  Serial.println((uintptr_t)g_i2c_lock, HEX);
+
+  Serial.println("[Main] shared memory allocation succeeded");
+  printRegionState(g_shared_memory);
 
   if (!sendAllSharedAddresses(g_shared_memory)) {
     Serial.println("[Main] failed to distribute shared addresses");
@@ -244,43 +279,24 @@ bool configureSharedLayout(SharedMemoryLayout layout)
 
 bool sendStartToAllSubcores()
 {
-  drainPendingFromCore(BMP280CORE_ID, "BMP280Core");
-  drainPendingFromCore(BMI160CORE_ID, "BMI160Core");
-  drainPendingFromCore(M_IMUCORE_ID, "MultiImuCore");
-
-  /* Send START to BMP280Core with BMP mode */
   int ret = MP.Send(MSG_SENSOR_START, g_bmp_mode, BMP280CORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(start->BMP) failed: ");
     Serial.println(ret);
     return false;
   }
-  /* Wait for ACK from BMP280Core */
-  if (!waitStateAckFromCore(BMP280CORE_ID, "BMP280Core")) {
-    return false;
-  }
 
-  /* Send START to BMI160Core with BMI mode */
   ret = MP.Send(MSG_SENSOR_START, g_bmi_mode, BMI160CORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(start->BMI) failed: ");
     Serial.println(ret);
     return false;
   }
-  /* Wait for ACK from BMI160Core */
-  if (!waitStateAckFromCore(BMI160CORE_ID, "BMI160Core")) {
-    return false;
-  }
 
-  /* Send START to MultiImuCore with MIMU mode */
   ret = MP.Send(MSG_SENSOR_START, g_mimu_mode, M_IMUCORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(start->MIMU) failed: ");
     Serial.println(ret);
-    return false;
-  }
-  /* Wait for ACK from MultiImuCore */
-  if (!waitStateAckFromCore(M_IMUCORE_ID, "MultiImuCore")) {
     return false;
   }
 
@@ -289,17 +305,10 @@ bool sendStartToAllSubcores()
 
 bool sendStopToAllSubcores()
 {
-  drainPendingFromCore(BMP280CORE_ID, "BMP280Core");
-  drainPendingFromCore(BMI160CORE_ID, "BMI160Core");
-  drainPendingFromCore(M_IMUCORE_ID, "MultiImuCore");
-
   int ret = MP.Send(MSG_SENSOR_STOP, (uint32_t)0, BMP280CORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(stop->BMP) failed: ");
     Serial.println(ret);
-    return false;
-  }
-  if (!waitStateAckFromCore(BMP280CORE_ID, "BMP280Core")) {
     return false;
   }
 
@@ -309,17 +318,11 @@ bool sendStopToAllSubcores()
     Serial.println(ret);
     return false;
   }
-  if (!waitStateAckFromCore(BMI160CORE_ID, "BMI160Core")) {
-    return false;
-  }
 
   ret = MP.Send(MSG_SENSOR_STOP, (uint32_t)0, M_IMUCORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(stop->MIMU) failed: ");
     Serial.println(ret);
-    return false;
-  }
-  if (!waitStateAckFromCore(M_IMUCORE_ID, "MultiImuCore")) {
     return false;
   }
 
@@ -331,6 +334,14 @@ bool sendStopToAllSubcores()
 static bool sendSharedAddressTo(int8_t msgid, int subid, void *addr)
 {
   uint32_t phys = MP.Virt2Phys(addr);
+  Serial.print("[Main] send shared msg=");
+  Serial.print(msgid);
+  Serial.print(" sub=");
+  Serial.print(subid);
+  Serial.print(" virt=0x");
+  Serial.print((uintptr_t)addr, HEX);
+  Serial.print(" phys=0x");
+  Serial.println(phys, HEX);
   int ret = MP.Send(msgid, phys, subid);
   if (ret < 0) {
     Serial.print("[Main] failed to send shared address msg ");
@@ -346,12 +357,20 @@ static bool sendSharedAddressTo(int8_t msgid, int subid, void *addr)
 
 static bool sendAllSharedAddresses(const SharedMemoryRegion &region)
 {
-  if (!g_allocator.isAllocated(region)) {
+  if (!theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
+    Serial.println("[Main] sendAllSharedAddresses: allocator reports not allocated");
+    return false;
+  }
+  if (!g_i2c_lock) {
+    Serial.println("[Main] sendAllSharedAddresses: i2c lock is null");
     return false;
   }
   if (!sendSharedAddressTo(MSG_SET_SHARED_BMP, BMP280CORE_ID, region.bmp.data)) return false;
   if (!sendSharedAddressTo(MSG_SET_SHARED_BMI, BMI160CORE_ID, region.bmi.data)) return false;
   if (!sendSharedAddressTo(MSG_SET_SHARED_IMU, M_IMUCORE_ID,  region.mimu.data)) return false;
+  if (!sendSharedAddressTo(MSG_SET_LOCK, BMP280CORE_ID, g_i2c_lock)) return false;
+  if (!sendSharedAddressTo(MSG_SET_LOCK, BMI160CORE_ID, g_i2c_lock)) return false;
+  if (!sendSharedAddressTo(MSG_SET_LOCK, M_IMUCORE_ID,  g_i2c_lock)) return false;
   return true;
 }
 
@@ -362,16 +381,34 @@ void setup() {
   Serial.begin(115200);
   while (!Serial);
 
-  MP.begin(BMI160CORE_ID);
-  MP.begin(BMP280CORE_ID);
-  MP.begin(M_IMUCORE_ID);
-  MP.RecvTimeout(3000);
+  Serial.println("[Main] setup begin");
 
-  if (!configureSharedLayout(SHARED_LAYOUT_0)) {
+  MP.begin(BMI160CORE_ID);
+  Serial.println("[Main] MP.begin BMI160 done");
+  MP.begin(BMP280CORE_ID);
+  Serial.println("[Main] MP.begin BMP280 done");
+  MP.begin(M_IMUCORE_ID);
+  Serial.println("[Main] MP.begin MIMU done");
+  MP.RecvTimeout(3000);
+  Serial.println("[Main] waiting subcore ready messages");
+
+  if (!waitSubcoreReady(BMP280CORE_ID, "BMP280Core") ||
+      !waitSubcoreReady(BMI160CORE_ID, "BMI160Core") ||
+      !waitSubcoreReady(M_IMUCORE_ID, "MultiImuCore")) {
+    Serial.println("[Main] setup aborted while waiting subcore ready");
     return;
   }
 
+  Serial.println("[Main] all subcores ready");
+  Serial.println("[Main] spinlock allocation is managed by shared layout");
+
   Serial.println("[Main] setup done");
+  return;
+
+FATAL_ERROR_SETUP:
+  while (1) {
+    usleep(1000 * 1000);
+  }
 }
 
 // ------------------------------------------------------------
@@ -380,90 +417,75 @@ void setup() {
 void loop() {
   static MainState mainState = MAIN_STATE_READY;
   static uint32_t stateEnteredMs = millis();
-  static bool firstRun = true;
-
-  if (!g_allocator.isAllocated(g_shared_memory)) {
-    delay(1000);
-    return;
-  }
+  static bool firstLayoutConfigured = false;
+  SharedMemoryLayout next = SHARED_LAYOUT_0;
 
   uint32_t now = millis();
+
+  if (!theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT) &&
+      mainState == MAIN_STATE_RUN) {
+    usleep(1000 * 1000);
+    return;
+  }
 
   if (mainState == MAIN_STATE_RUN) {
     if ((uint32_t)(now - stateEnteredMs) >= MODE_SWITCH_INTERVAL_MS) {
       if (sendStopToAllSubcores()) {
+        if (theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
+          if (!theAllocator.free(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
+            Serial.println("[Main] FATAL: shared memory fence check failed on stop");
+            goto FATAL_ERROR;
+          }
+        }
         mainState = MAIN_STATE_READY;
         stateEnteredMs = now;
         Serial.println("[Main] mode=READY");
+        usleep(100 * 1000);
+      } else {
+        Serial.println("[Main] FATAL: failed to stop subcores");
+        goto FATAL_ERROR;
       }
     }
   }
 
   if (mainState == MAIN_STATE_READY) {
     if ((uint32_t)(now - stateEnteredMs) >= READY_HOLD_MS) {
-      if (!firstRun) {
-        SharedMemoryLayout next = nextLayout(g_active_layout);
-        if (!configureSharedLayout(next)) {
-          delay(200);
-          return;
-        }
+      next = firstLayoutConfigured ? nextLayout(g_active_layout) : SHARED_LAYOUT_2;
+      if (!configureSharedLayout(next)) {
+        return;
       }
+      firstLayoutConfigured = true;
       if (sendStartToAllSubcores()) {
-        firstRun = false;
         mainState = MAIN_STATE_RUN;
         stateEnteredMs = now;
         Serial.println("[Main] mode=RUN");
-        // Give subcores a short time window right after START.
-        delay(100);
+        usleep(100 * 1000);
+      } else {
+        Serial.println("[Main] FATAL: failed to start subcores");
+        goto FATAL_ERROR;
       }
     }
-
-    delay(50);
     return;
   }
 
-  int8_t msgid;
-  uint32_t seq = 0;
-  int ret = 0;
-
-  ret = MP.Send(MSG_REQ_BMP, (uint32_t)0, BMP280CORE_ID);
-  if (ret < 0) {
-    Serial.print("[Main] MP.Send(BMP) failed: ");
-    Serial.println(ret);
+  if (g_shared_memory.bmp.data) {
+    float *bmpData = static_cast<float*>(g_shared_memory.bmp.data);
+    printBMP(bmpData);
   }
 
-  if (MP.Recv(&msgid, &seq, BMP280CORE_ID) >= 0 && msgid == MSG_RET_BMP) {
-    if (seq == SENSOR_ERROR_OK && g_shared_memory.bmp.data) {
-      float *bmpData = static_cast<float*>(g_shared_memory.bmp.data);
-      printBMP(bmpData);
-    }
+  if (g_shared_memory.bmi.data) {
+    float *bmiData = static_cast<float*>(g_shared_memory.bmi.data);
+    printBMI(bmiData);
   }
 
-  ret = MP.Send(MSG_REQ_BMI, (uint32_t)0, BMI160CORE_ID);
-  if (ret < 0) {
-    Serial.print("[Main] MP.Send(BMI) failed: ");
-    Serial.println(ret);
+  if (g_shared_memory.mimu.data) {
+    float *mimuData = static_cast<float*>(g_shared_memory.mimu.data);
+    printMIMU(mimuData);
   }
+  return;
 
-  if (MP.Recv(&msgid, &seq, BMI160CORE_ID) >= 0 && msgid == MSG_RET_BMI) {
-    if (seq == SENSOR_ERROR_OK && g_shared_memory.bmi.data) {
-      float *bmiData = static_cast<float*>(g_shared_memory.bmi.data);
-      printBMI(bmiData);
-    }
+FATAL_ERROR:
+  while (1) {
+    usleep(1000 * 1000);
   }
-
-  ret = MP.Send(MSG_REQ_MIMU, (uint32_t)0, M_IMUCORE_ID);
-  if (ret < 0) {
-    Serial.print("[Main] MP.Send(MIMU) failed: ");
-    Serial.println(ret);
-  }
-
-  if (MP.Recv(&msgid, &seq, M_IMUCORE_ID) >= 0 && msgid == MSG_RET_MIMU) {
-    if (seq == SENSOR_ERROR_OK && g_shared_memory.mimu.data) {
-      float *mimuData = static_cast<float*>(g_shared_memory.mimu.data);
-      printMIMU(mimuData);
-    }
-  }
-
-  delay(1000);
 }
