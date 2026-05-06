@@ -1,4 +1,4 @@
-﻿/*
+/*
  *  SharedMemoryConfig.h - Shared memory layout configuration for ManySensor.
  *  Author Interested-In-Spresense
  *
@@ -39,31 +39,18 @@
 #ifndef SHARED_MEMORY_CONFIG_H
 #define SHARED_MEMORY_CONFIG_H
 
+#include <InterCoreRingBuffer.h>
 #include <SharedMemoryAllocator.h>
 #include <MultiCoreSpinLock.h>
+#include "ManySensorShared.h"
 
-/* --- Sensor size-per-entry presets (bytes) --- */
-/* BMP280: temp + pressure + altitude = FULL (3 floats), pressure only = PRESS (1 float) */
-#define SHARED_BMP_BYTES_PRESS  (1 * sizeof(float))
-#define SHARED_BMP_BYTES_FULL   (3 * sizeof(float))
-
-/* BMI160: accel x/y/z = ACC (3 floats), gyro x/y/z = GYRO (3 floats), accel+gyro = FULL (6 floats) */
-#define SHARED_BMI_BYTES_ACC    (3 * sizeof(float))
-#define SHARED_BMI_BYTES_GYRO   (3 * sizeof(float))
-#define SHARED_BMI_BYTES_FULL   (6 * sizeof(float))
-
-/* MIMU: accel+gyro = AG (6 floats), accel+gyro+extended = FULL (8 floats) */
-#define SHARED_MIMU_BYTES_DATA  (6 * sizeof(float))
-#define SHARED_MIMU_BYTES_FULL  (8 * sizeof(float))
-
-/* Backward compatibility for legacy typo-based macro names. */
-#define SHARD_BMP_BYTES_PRESS   SHARED_BMP_BYTES_PRESS
-#define SHARD_BMP_BYTES_FULL    SHARED_BMP_BYTES_FULL
-#define SHARD_BMI_BYTES_ACC     SHARED_BMI_BYTES_ACC
-#define SHARD_BMI_BYTES_GYRO    SHARED_BMI_BYTES_GYRO
-#define SHARD_BMI_BYTES_FULL    SHARED_BMI_BYTES_FULL
-#define SHARD_MIMU_BYTES_DATA   SHARED_MIMU_BYTES_DATA
-#define SHARD_MIMU_BYTES_FULL   SHARED_MIMU_BYTES_FULL
+/* Shared memory stores per-core ringbuffer instances (one each). */
+#define SHARED_BMP_RINGBUF_BYTES_FULL  (sizeof(InterCoreRingBuffer<BMP280Full,  RINGBUFFER_CAPACITY>))
+#define SHARED_BMP_RINGBUF_BYTES_PRESS (sizeof(InterCoreRingBuffer<BMP280Press, RINGBUFFER_CAPACITY>))
+#define SHARED_BMI_RINGBUF_BYTES_ACC   (sizeof(InterCoreRingBuffer<BMI160Acc,   RINGBUFFER_CAPACITY>))
+#define SHARED_BMI_RINGBUF_BYTES_IMU   (sizeof(InterCoreRingBuffer<BMI160Imu,   RINGBUFFER_CAPACITY>))
+#define SHARED_MIMU_RINGBUF_BYTES_RAW  (sizeof(InterCoreRingBuffer<MIMURaw,     RINGBUFFER_CAPACITY>))
+#define SHARED_MIMU_RINGBUF_BYTES_FULL (sizeof(InterCoreRingBuffer<MIMUFull,    RINGBUFFER_CAPACITY>))
 
 enum SharedMemoryLayout {
   SHARED_LAYOUT_0 = 0,
@@ -81,6 +68,17 @@ struct SharedMemoryRegion {
   SharedMemoryArea mimu;
 };
 
+inline SharedMemoryRegion makeInitialSharedMemoryRegion()
+{
+  SharedMemoryRegion region = {
+    { NULL, sizeof(MultiCoreSpinLock),         1, NULL, 0 },
+    { NULL, SHARED_BMP_RINGBUF_BYTES_FULL,  1, NULL, 0 },
+    { NULL, SHARED_BMI_RINGBUF_BYTES_ACC,   1, NULL, 0 },
+    { NULL, SHARED_MIMU_RINGBUF_BYTES_RAW,  1, NULL, 0 },
+  };
+  return region;
+}
+
 inline SharedMemoryArea *regionAreas(SharedMemoryRegion *region)
 {
   return &region->spinlock;
@@ -96,21 +94,21 @@ struct SharedLayoutMap {
 };
 
 constexpr SharedLayoutMap sharedLayouts[SHARED_LAYOUT_COUNT] = {
-  /* SHARED_LAYOUT_0: current sensor payload sizes */
+  /* SHARED_LAYOUT_0: BMP_FULL, BMI_ACC, MIMU_RAW */
   { { { sizeof(MultiCoreSpinLock), 1 },
-    { SHARED_BMP_BYTES_FULL, 1 },
-    { SHARED_BMI_BYTES_ACC, 1 },
-    { SHARED_MIMU_BYTES_DATA, 1 } } },
-  /* SHARED_LAYOUT_1: BMP pressure only, BMI accel+gyro, MIMU accel+gyro */
+    { SHARED_BMP_RINGBUF_BYTES_FULL,  1 },
+    { SHARED_BMI_RINGBUF_BYTES_ACC,   1 },
+    { SHARED_MIMU_RINGBUF_BYTES_RAW,  1 } } },
+  /* SHARED_LAYOUT_1: BMP_PRESS, BMI_IMU, MIMU_RAW */
   { { { sizeof(MultiCoreSpinLock), 1 },
-    { SHARED_BMP_BYTES_PRESS, 16 },
-    { SHARED_BMI_BYTES_FULL, 16 },
-    { SHARED_MIMU_BYTES_DATA, 64 } } },
-  /* SHARED_LAYOUT_2: BMP full, BMI full, MIMU extended */
+    { SHARED_BMP_RINGBUF_BYTES_PRESS, 1 },
+    { SHARED_BMI_RINGBUF_BYTES_IMU,   1 },
+    { SHARED_MIMU_RINGBUF_BYTES_RAW,  1 } } },
+  /* SHARED_LAYOUT_2: BMP_FULL, BMI_IMU, MIMU_FULL */
   { { { sizeof(MultiCoreSpinLock), 1 },
-    { SHARED_BMP_BYTES_FULL, 16 },
-    { SHARED_BMI_BYTES_FULL, 16 },
-    { SHARED_MIMU_BYTES_FULL, 64 } } },
+    { SHARED_BMP_RINGBUF_BYTES_FULL,  1 },
+    { SHARED_BMI_RINGBUF_BYTES_IMU,   1 },
+    { SHARED_MIMU_RINGBUF_BYTES_FULL, 1 } } },
 };
 
 /* Debug print only: maps SharedMemoryLayout enum values to readable names. */

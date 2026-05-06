@@ -1,4 +1,4 @@
-﻿/*
+/*
  *  ManySensorShared.h - Shared definitions for ManySensor multi-core sketch.
  *  Author Interested-In-Spresense
  *
@@ -30,7 +30,8 @@
 #define MSG_SET_LOCK       13
 #define MSG_SENSOR_STOP    20
 #define MSG_SENSOR_START   21
-#define MSG_SUBCORE_READY  22
+
+#define RINGBUFFER_CAPACITY 64
 
 enum SensorState {
 	SENSOR_STATE_READY = 0,
@@ -88,43 +89,31 @@ enum MIMUMode {
 /* MultiIMU full data: [timestamp_s, temp_c, ax, ay, az, gx, gy, gz] */
 #define MULTIMU_FULL_LEN   8
 
-/* Ring buffer entry structures for inter-core data logging */
+/* --- Mode-specific payload structs --- */
 
-/* BMP280 mode-specific entries */
-struct BMP280FullData {
+struct BMP280Full {
 	float temperature;
 	float pressure;
 	float altitude;
 };
 
-struct BMP280PressData {
+struct BMP280Press {
 	float pressure;
 };
 
-/* BMI160 mode-specific entries */
-struct BMI160AccData {
+struct BMI160Acc {
 	float ax;
 	float ay;
 	float az;
 };
 
-struct BMI160GyroData {
+struct BMI160Gyro {
 	float gx;
 	float gy;
 	float gz;
 };
 
-struct BMI160FullData {
-	float ax;
-	float ay;
-	float az;
-	float gx;
-	float gy;
-	float gz;
-};
-
-/* MultiIMU mode-specific entries */
-struct MIMUData {
+struct BMI160Imu {
 	float ax;
 	float ay;
 	float az;
@@ -133,7 +122,16 @@ struct MIMUData {
 	float gz;
 };
 
-struct MIMUFullData {
+struct MIMURaw {
+	float ax;
+	float ay;
+	float az;
+	float gx;
+	float gy;
+	float gz;
+};
+
+struct MIMUFull {
 	float timestamp;
 	float temperature;
 	float ax;

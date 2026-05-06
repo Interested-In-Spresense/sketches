@@ -1,4 +1,4 @@
-﻿/*
+/*
  *  MultiImuCore.ino - MultiIMU sensor core for ManySensor.
  *  Author Interested-In-Spresense
  *
@@ -22,17 +22,18 @@
 #endif
 
 #include <MP.h>
+#include <InterCoreRingBuffer.h>
+#include <MultiCoreSpinLock.h>
 #include "SpresenseIMU.h"
 #include "ManySensorShared.h"
-#include <MultiCoreSpinLock.h>
 
 #define SAMPLINGRATE      (1920)
 #define ADRANGE           (4)
 #define GDRANGE           (500)
 #define FIFO_DEPTH        (1)
 
-static float *g_data = NULL;  /* DATA: [ax, ay, az, gx, gy, gz], FULL: [ts_s, temp_c, ax, ay, az, gx, gy, gz] */
-static MultiCoreSpinLock *g_i2c_lock = NULL;  /* Reserved for future lock-based path */
+static void *g_ring = NULL;
+static MultiCoreSpinLock *g_i2c_lock = NULL;
 static uint32_t g_state = SENSOR_STATE_READY;
 static uint32_t g_mode = MIMU_MODE_DATA;
 
@@ -44,6 +45,9 @@ static void haltOnError(int32_t errCode)
   }
 }
 
+// ------------------------------------------------------------
+// SETUP
+// ------------------------------------------------------------
 void setup() {
   int ret = SpresenseIMU.begin();
   if (ret < 0) {
@@ -64,69 +68,66 @@ void setup() {
 
   MP.begin();
   MP.RecvTimeout(10);
-  MP.Send(MSG_SUBCORE_READY, (uint32_t)M_IMUCORE_ID);
 }
 
+// ------------------------------------------------------------
+// LOOP
+// ------------------------------------------------------------
 void loop() {
   int8_t msgid;
-  uint32_t phys_addr;
+  uint32_t payload;
 
-  int ret = MP.Recv(&msgid, &phys_addr, 0);
+  int ret = MP.Recv(&msgid, &payload, 0);
   if (ret >= 0) {
     switch (msgid) {
     case MSG_SET_SHARED_IMU:
-      g_data = reinterpret_cast<float *>(phys_addr);
+      g_ring = reinterpret_cast<void *>(payload);
       return;
-
     case MSG_SET_LOCK:
-      g_i2c_lock = reinterpret_cast<MultiCoreSpinLock *>(phys_addr);
+      g_i2c_lock = reinterpret_cast<MultiCoreSpinLock *>(payload);
       return;
-
     case MSG_SENSOR_STOP:
       g_state = SENSOR_STATE_READY;
       return;
-
     case MSG_SENSOR_START:
       g_state = SENSOR_STATE_RUN;
-      g_mode = (uint32_t)phys_addr;
+      g_mode = (uint32_t)payload;
       return;
-
     default:
       haltOnError(SENSOR_ERR_MIMU_UNEXPECTED_MSG);
     }
   }
 
-  if (g_state != SENSOR_STATE_RUN) {
+  if (g_state != SENSOR_STATE_RUN || !g_ring) {
     return;
   }
 
-  if (!g_data) {
-    return;
-  }
-
-  /* Read sensor and write to shared memory */
   pwbImuData d;
-
   if (!SpresenseIMU.get(d)) {
-    /* Data not available, ignore this request */
     return;
   }
 
   if (g_mode == MIMU_MODE_FULL) {
-    g_data[0] = d.data.timestamp / 19200000.0f;
-    g_data[1] = d.data.temp;
-    g_data[2] = d.data.ax;
-    g_data[3] = d.data.ay;
-    g_data[4] = d.data.az;
-    g_data[5] = d.data.gx;
-    g_data[6] = d.data.gy;
-    g_data[7] = d.data.gz;
+    MIMUFull sample = {
+      (uint32_t)(d.data.timestamp / 19200000.0f),
+      d.data.temp,
+      d.data.ax,
+      d.data.ay,
+      d.data.az,
+      d.data.gx,
+      d.data.gy,
+      d.data.gz
+    };
+    reinterpret_cast<InterCoreRingBuffer<MIMUFull, RINGBUFFER_CAPACITY> *>(g_ring)->write(sample);
   } else {
-    g_data[0] = d.data.ax;
-    g_data[1] = d.data.ay;
-    g_data[2] = d.data.az;
-    g_data[3] = d.data.gx;
-    g_data[4] = d.data.gy;
-    g_data[5] = d.data.gz;
+    MIMURaw sample = {
+      d.data.ax,
+      d.data.ay,
+      d.data.az,
+      d.data.gx,
+      d.data.gy,
+      d.data.gz
+    };
+    reinterpret_cast<InterCoreRingBuffer<MIMURaw, RINGBUFFER_CAPACITY> *>(g_ring)->write(sample);
   }
 }

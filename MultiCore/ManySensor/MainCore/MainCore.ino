@@ -1,4 +1,4 @@
-﻿/*
+/*
  *  MainCore.ino - MultiCore coordinator for many sensors.
  *  Author Interested-In-Spresense
  *
@@ -23,48 +23,41 @@
 
 #include <Arduino.h>
 #include <MP.h>
-#include "ManySensorShared.h"
-#include "SharedMemoryConfig.h"
+#include <new>
+#include <InterCoreRingBuffer.h>
 #include <MultiCoreSpinLock.h>
 #include <SharedMemoryAllocator.h>
 
-static SharedMemoryRegion g_shared_memory = {
-  { NULL, sizeof(MultiCoreSpinLock), 1, NULL, 0 },
-  { NULL, BMP280_DATA_LEN * sizeof(float), 0, NULL, 0 },
-  { NULL, BMI160_DATA_LEN * sizeof(float), 0, NULL, 0 },
-  { NULL, MULTIMU_DATA_LEN * sizeof(float), 0, NULL, 0 },
-};
+#include "ManySensorShared.h"
+#include "SharedMemoryConfig.h"
+
+static SharedMemoryRegion g_shared_memory = makeInitialSharedMemoryRegion();
 
 constexpr uint32_t MODE_SWITCH_INTERVAL_MS = 10000;
 constexpr uint32_t READY_HOLD_MS = 300;
+constexpr uint32_t LOCK_SPIN_LIMIT = 3000;
 static uint32_t g_bmp_mode = BMP280_MODE_FULL;
 static uint32_t g_bmi_mode = BMI160_MODE_ACC;
 static uint32_t g_mimu_mode = MIMU_MODE_DATA;
 static SharedMemoryLayout g_active_layout = SHARED_LAYOUT_2;
 static MultiCoreSpinLock *g_i2c_lock = NULL;
 
+#ifdef ENABLE_DIAG
+constexpr uint32_t DIAG_PRINT_INTERVAL_MS = 2000;
+
+struct SensorDiag {
+  uint32_t okCount;
+  uint32_t noDataCount;
+  uint32_t lastOkMs;
+};
+
+static SensorDiag g_bmi_diag = {0, 0, 0};
+static SensorDiag g_mimu_diag = {0, 0, 0};
+static uint32_t g_diag_last_print_ms = 0;
+#endif
+
 static SharedMemoryAllocator theAllocator;
 static bool sendAllSharedAddresses(const SharedMemoryRegion &region);
-
-static bool waitSubcoreReady(int subid, const char *name)
-{
-  int8_t msgid = 0;
-  uint32_t value = 0;
-  int ret = MP.Recv(&msgid, &value, subid);
-  if (ret < 0) {
-    Serial.print("[Main] READY timeout from ");
-    Serial.println(name);
-    return false;
-  }
-  if (msgid != MSG_SUBCORE_READY) {
-    Serial.print("[Main] unexpected startup msg from ");
-    Serial.print(name);
-    Serial.print(": msgid=");
-    Serial.println(msgid);
-    return false;
-  }
-  return true;
-}
 
 enum MainState {
   MAIN_STATE_RUN = 0,
@@ -72,48 +65,6 @@ enum MainState {
 };
 
 namespace {
-
-void printLayoutAreaInfo(const char *name, const SharedLayoutArea &area)
-{
-  Serial.print("[Main]   ");
-  Serial.print(name);
-  Serial.print(": size=");
-  Serial.print((unsigned long)area.size);
-  Serial.print(" count=");
-  Serial.print((unsigned long)area.count);
-  Serial.print(" total=");
-  Serial.println((unsigned long)(area.size * area.count));
-}
-
-void printLayoutRequest(SharedMemoryLayout layout)
-{
-  Serial.print("[Main] configure request: ");
-  Serial.println(layoutNameString[layout]);
-  printLayoutAreaInfo("spinlock", sharedLayouts[layout].areas[0]);
-  printLayoutAreaInfo("bmp", sharedLayouts[layout].areas[1]);
-  printLayoutAreaInfo("bmi", sharedLayouts[layout].areas[2]);
-  printLayoutAreaInfo("mimu", sharedLayouts[layout].areas[3]);
-}
-
-void printRegionState(const SharedMemoryRegion &region)
-{
-  Serial.print("[Main]   region spinlock data=");
-  Serial.print((uintptr_t)region.spinlock.data, HEX);
-  Serial.print(" total_bytes=");
-  Serial.println((unsigned long)region.spinlock.total_bytes);
-  Serial.print("[Main]   region bmp data=");
-  Serial.print((uintptr_t)region.bmp.data, HEX);
-  Serial.print(" total_bytes=");
-  Serial.println((unsigned long)region.bmp.total_bytes);
-  Serial.print("[Main]   region bmi data=");
-  Serial.print((uintptr_t)region.bmi.data, HEX);
-  Serial.print(" total_bytes=");
-  Serial.println((unsigned long)region.bmi.total_bytes);
-  Serial.print("[Main]   region mimu data=");
-  Serial.print((uintptr_t)region.mimu.data, HEX);
-  Serial.print(" total_bytes=");
-  Serial.println((unsigned long)region.mimu.total_bytes);
-}
 
 void applyModesForLayout(SharedMemoryLayout layout)
 {
@@ -145,109 +96,216 @@ SharedMemoryLayout nextLayout(SharedMemoryLayout current)
   }
 }
 
-void printBMP(const float *bmpData)
+#ifdef ENABLE_DIAG
+void recordBmiDiag(bool ok, uint32_t now)
 {
-  if (g_bmp_mode == BMP280_MODE_PRESS) {
-    Serial.print("[BMP] pressure=");
-    Serial.print(bmpData[0]);
-    Serial.println("Pa");
+  if (ok) {
+    g_bmi_diag.okCount++;
+    g_bmi_diag.lastOkMs = now;
   } else {
-    Serial.print("[BMP] temp=");
-    Serial.print(bmpData[0]);
-    Serial.print("C pressure=");
-    Serial.print(bmpData[1]);
-    Serial.print("Pa altitude=");
-    Serial.print(bmpData[2]);
-    Serial.println("m");
+    g_bmi_diag.noDataCount++;
   }
 }
 
-void printBMI(const float *bmiData)
+void recordMimuDiag(bool ok, uint32_t now)
 {
-  if (g_bmi_mode == BMI160_MODE_ACC) {
-    Serial.print("[BMI] acc[m/s^2]=");
-    Serial.print(bmiData[0]);
-    Serial.print(", ");
-    Serial.print(bmiData[1]);
-    Serial.print(", ");
-    Serial.println(bmiData[2]);
-  } else if (g_bmi_mode == BMI160_MODE_GYRO) {
-    Serial.print("[BMI] gyro[rad/s]=");
-    Serial.print(bmiData[0], 4);
-    Serial.print(", ");
-    Serial.print(bmiData[1], 4);
-    Serial.print(", ");
-    Serial.println(bmiData[2], 4);
+  if (ok) {
+    g_mimu_diag.okCount++;
+    g_mimu_diag.lastOkMs = now;
   } else {
-    Serial.print("[BMI] acc[m/s^2]=");
-    Serial.print(bmiData[0]);
-    Serial.print(", ");
-    Serial.print(bmiData[1]);
-    Serial.print(", ");
-    Serial.print(bmiData[2]);
-    Serial.print(" gyro[rad/s]=");
-    Serial.print(bmiData[3], 4);
-    Serial.print(", ");
-    Serial.print(bmiData[4], 4);
-    Serial.print(", ");
-    Serial.println(bmiData[5], 4);
+    g_mimu_diag.noDataCount++;
   }
 }
 
-void printMIMU(const float *mimuData)
+void printDiagIfDue(uint32_t now)
 {
-  if (g_mimu_mode == MIMU_MODE_FULL) {
-    Serial.print("[MIMU] ts=");
-    Serial.print(mimuData[0]);
-    Serial.print(" temp[C]=");
-    Serial.print(mimuData[1]);
-    Serial.print(" acc[m/s^2]=");
-    Serial.print(mimuData[2]);
-    Serial.print(", ");
-    Serial.print(mimuData[3]);
-    Serial.print(", ");
-    Serial.print(mimuData[4]);
-    Serial.print(" gyro[rad/s]=");
-    Serial.print(mimuData[5], 4);
-    Serial.print(", ");
-    Serial.print(mimuData[6], 4);
-    Serial.print(", ");
-    Serial.println(mimuData[7], 4);
-  } else {
-    Serial.print("[MIMU] acc[m/s^2]=");
-    Serial.print(mimuData[0]);
-    Serial.print(", ");
-    Serial.print(mimuData[1]);
-    Serial.print(", ");
-    Serial.print(mimuData[2]);
-    Serial.print(" gyro[rad/s]=");
-    Serial.print(mimuData[3], 4);
-    Serial.print(", ");
-    Serial.print(mimuData[4], 4);
-    Serial.print(", ");
-    Serial.println(mimuData[5], 4);
+  if ((uint32_t)(now - g_diag_last_print_ms) < DIAG_PRINT_INTERVAL_MS) {
+    return;
   }
+
+  g_diag_last_print_ms = now;
+  Serial.print("[DIAG] layout=");
+  Serial.print(layoutNameString[g_active_layout]);
+  Serial.print(" bmiMode=");
+  Serial.print(g_bmi_mode);
+  Serial.print(" bmiOk=");
+  Serial.print(g_bmi_diag.okCount);
+  Serial.print(" bmiMiss=");
+  Serial.print(g_bmi_diag.noDataCount);
+  Serial.print(" bmiLastOkAgoMs=");
+  Serial.print((uint32_t)(now - g_bmi_diag.lastOkMs));
+  Serial.print(" mimuMode=");
+  Serial.print(g_mimu_mode);
+  Serial.print(" mimuOk=");
+  Serial.print(g_mimu_diag.okCount);
+  Serial.print(" mimuMiss=");
+  Serial.print(g_mimu_diag.noDataCount);
+  Serial.print(" mimuLastOkAgoMs=");
+  Serial.println((uint32_t)(now - g_mimu_diag.lastOkMs));
+}
+#else
+void recordBmiDiag(bool ok, uint32_t now)
+{
+  (void)ok;
+  (void)now;
+}
+
+void recordMimuDiag(bool ok, uint32_t now)
+{
+  (void)ok;
+  (void)now;
+}
+
+void printDiagIfDue(uint32_t now)
+{
+  (void)now;
+}
+#endif
+
+void printBMP(const BMP280Press &data)
+{
+  Serial.print("[BMP] pressure=");
+  Serial.print(data.pressure);
+  Serial.println("Pa");
+}
+
+void printBMP(const BMP280Full &data)
+{
+  Serial.print("[BMP] temp=");
+  Serial.print(data.temperature);
+  Serial.print("C pressure=");
+  Serial.print(data.pressure);
+  Serial.print("Pa altitude=");
+  Serial.print(data.altitude);
+  Serial.println("m");
+}
+
+void printBMI(const BMI160Acc &data)
+{
+  Serial.print("[BMI] acc[m/s^2]=");
+  Serial.print(data.ax);
+  Serial.print(", ");
+  Serial.print(data.ay);
+  Serial.print(", ");
+  Serial.println(data.az);
+}
+
+void printBMI(const BMI160Gyro &data)
+{
+  Serial.print("[BMI] gyro[rad/s]=");
+  Serial.print(data.gx, 4);
+  Serial.print(", ");
+  Serial.print(data.gy, 4);
+  Serial.print(", ");
+  Serial.println(data.gz, 4);
+}
+
+void printBMI(const BMI160Imu &data)
+{
+  Serial.print("[BMI] acc[m/s^2]=");
+  Serial.print(data.ax);
+  Serial.print(", ");
+  Serial.print(data.ay);
+  Serial.print(", ");
+  Serial.print(data.az);
+  Serial.print(" gyro[rad/s]=");
+  Serial.print(data.gx, 4);
+  Serial.print(", ");
+  Serial.print(data.gy, 4);
+  Serial.print(", ");
+  Serial.println(data.gz, 4);
+}
+
+void printMIMU(const MIMURaw &data)
+{
+  Serial.print("[MIMU] acc[m/s^2]=");
+  Serial.print(data.ax);
+  Serial.print(", ");
+  Serial.print(data.ay);
+  Serial.print(", ");
+  Serial.print(data.az);
+  Serial.print(" gyro[rad/s]=");
+  Serial.print(data.gx, 4);
+  Serial.print(", ");
+  Serial.print(data.gy, 4);
+  Serial.print(", ");
+  Serial.println(data.gz, 4);
+}
+
+void printMIMU(const MIMUFull &data)
+{
+  Serial.print("[MIMU] ts=");
+  Serial.print(data.timestamp);
+  Serial.print(" temp[C]=");
+  Serial.print(data.temperature);
+  Serial.print(" acc[m/s^2]=");
+  Serial.print(data.ax);
+  Serial.print(", ");
+  Serial.print(data.ay);
+  Serial.print(", ");
+  Serial.print(data.az);
+  Serial.print(" gyro[rad/s]=");
+  Serial.print(data.gx, 4);
+  Serial.print(", ");
+  Serial.print(data.gy, 4);
+  Serial.print(", ");
+  Serial.println(data.gz, 4);
+}
+
+template<typename T>
+bool readLatestLocked(InterCoreRingBuffer<T, RINGBUFFER_CAPACITY> *ring, T *latest)
+{
+  if (!ring || !latest || !g_i2c_lock) {
+    return false;
+  }
+  if (!MultiCoreSpin::acquire(g_i2c_lock, LOCK_SPIN_LIMIT)) {
+    return false;
+  }
+
+  bool hasData = false;
+  T temp;
+  while (ring->read(temp)) {
+    *latest = temp;
+    hasData = true;
+  }
+
+  MultiCoreSpin::release(g_i2c_lock);
+  return hasData;
 }
 
 bool configureSharedLayout(SharedMemoryLayout layout)
 {
-  printLayoutRequest(layout);
-  Serial.print("[Main] allocator currently allocated=");
-  Serial.println(theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT) ? "yes" : "no");
-
   if (theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
-    Serial.println("[Main] freeing previous shared layout");
+    if (g_shared_memory.bmp.data) {
+      if (g_bmp_mode == BMP280_MODE_PRESS) {
+        reinterpret_cast<InterCoreRingBuffer<BMP280Press, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmp.data)->~InterCoreRingBuffer();
+      } else {
+        reinterpret_cast<InterCoreRingBuffer<BMP280Full, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmp.data)->~InterCoreRingBuffer();
+      }
+    }
+    if (g_shared_memory.bmi.data) {
+      if (g_bmi_mode == BMI160_MODE_ACC) {
+        reinterpret_cast<InterCoreRingBuffer<BMI160Acc, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmi.data)->~InterCoreRingBuffer();
+      } else {
+        reinterpret_cast<InterCoreRingBuffer<BMI160Imu, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmi.data)->~InterCoreRingBuffer();
+      }
+    }
+    if (g_shared_memory.mimu.data) {
+      if (g_mimu_mode == MIMU_MODE_FULL) {
+        reinterpret_cast<InterCoreRingBuffer<MIMUFull, RINGBUFFER_CAPACITY> *>(g_shared_memory.mimu.data)->~InterCoreRingBuffer();
+      } else {
+        reinterpret_cast<InterCoreRingBuffer<MIMURaw, RINGBUFFER_CAPACITY> *>(g_shared_memory.mimu.data)->~InterCoreRingBuffer();
+      }
+    }
+
     if (!theAllocator.free(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
       Serial.println("[Main] shared memory fence check failed during layout switch");
-    } else {
-      Serial.println("[Main] previous shared layout freed");
     }
   }
 
   if (!theAllocator.alloc(sharedLayouts[layout].areas, SHARED_AREA_COUNT, regionAreas(&g_shared_memory))) {
-    Serial.print("[Main] shared memory allocation failed: layout=");
+    Serial.print("[Main] shared memory allocation failed: ");
     Serial.println(layoutNameString[layout]);
-    printRegionState(g_shared_memory);
     return false;
   }
 
@@ -257,11 +315,24 @@ bool configureSharedLayout(SharedMemoryLayout layout)
     return false;
   }
   MultiCoreSpin::init(g_i2c_lock);
-  Serial.print("[Main] i2c spinlock ready at 0x");
-  Serial.println((uintptr_t)g_i2c_lock, HEX);
 
-  Serial.println("[Main] shared memory allocation succeeded");
-  printRegionState(g_shared_memory);
+  applyModesForLayout(layout);
+
+  if (g_bmp_mode == BMP280_MODE_PRESS) {
+    new (g_shared_memory.bmp.data) InterCoreRingBuffer<BMP280Press, RINGBUFFER_CAPACITY>();
+  } else {
+    new (g_shared_memory.bmp.data) InterCoreRingBuffer<BMP280Full, RINGBUFFER_CAPACITY>();
+  }
+  if (g_bmi_mode == BMI160_MODE_ACC) {
+    new (g_shared_memory.bmi.data) InterCoreRingBuffer<BMI160Acc, RINGBUFFER_CAPACITY>();
+  } else {
+    new (g_shared_memory.bmi.data) InterCoreRingBuffer<BMI160Imu, RINGBUFFER_CAPACITY>();
+  }
+  if (g_mimu_mode == MIMU_MODE_FULL) {
+    new (g_shared_memory.mimu.data) InterCoreRingBuffer<MIMUFull, RINGBUFFER_CAPACITY>();
+  } else {
+    new (g_shared_memory.mimu.data) InterCoreRingBuffer<MIMURaw, RINGBUFFER_CAPACITY>();
+  }
 
   if (!sendAllSharedAddresses(g_shared_memory)) {
     Serial.println("[Main] failed to distribute shared addresses");
@@ -269,7 +340,6 @@ bool configureSharedLayout(SharedMemoryLayout layout)
   }
 
   g_active_layout = layout;
-  applyModesForLayout(layout);
   Serial.print("[Main] shared layout=");
   Serial.println(layoutNameString[g_active_layout]);
   return true;
@@ -285,21 +355,18 @@ bool sendStartToAllSubcores()
     Serial.println(ret);
     return false;
   }
-
   ret = MP.Send(MSG_SENSOR_START, g_bmi_mode, BMI160CORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(start->BMI) failed: ");
     Serial.println(ret);
     return false;
   }
-
   ret = MP.Send(MSG_SENSOR_START, g_mimu_mode, M_IMUCORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(start->MIMU) failed: ");
     Serial.println(ret);
     return false;
   }
-
   return true;
 }
 
@@ -311,21 +378,18 @@ bool sendStopToAllSubcores()
     Serial.println(ret);
     return false;
   }
-
   ret = MP.Send(MSG_SENSOR_STOP, (uint32_t)0, BMI160CORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(stop->BMI) failed: ");
     Serial.println(ret);
     return false;
   }
-
   ret = MP.Send(MSG_SENSOR_STOP, (uint32_t)0, M_IMUCORE_ID);
   if (ret < 0) {
     Serial.print("[Main] MP.Send(stop->MIMU) failed: ");
     Serial.println(ret);
     return false;
   }
-
   return true;
 }
 
@@ -334,22 +398,12 @@ bool sendStopToAllSubcores()
 static bool sendSharedAddressTo(int8_t msgid, int subid, void *addr)
 {
   uint32_t phys = MP.Virt2Phys(addr);
-  Serial.print("[Main] send shared msg=");
-  Serial.print(msgid);
-  Serial.print(" sub=");
-  Serial.print(subid);
-  Serial.print(" virt=0x");
-  Serial.print((uintptr_t)addr, HEX);
-  Serial.print(" phys=0x");
-  Serial.println(phys, HEX);
   int ret = MP.Send(msgid, phys, subid);
   if (ret < 0) {
-    Serial.print("[Main] failed to send shared address msg ");
+    Serial.print("[Main] send shared failed msg=");
     Serial.print(msgid);
-    Serial.print(" to subcore ");
-    Serial.print(subid);
-    Serial.print(": ");
-    Serial.println(ret);
+    Serial.print(" sub=");
+    Serial.println(subid);
     return false;
   }
   return true;
@@ -358,11 +412,6 @@ static bool sendSharedAddressTo(int8_t msgid, int subid, void *addr)
 static bool sendAllSharedAddresses(const SharedMemoryRegion &region)
 {
   if (!theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
-    Serial.println("[Main] sendAllSharedAddresses: allocator reports not allocated");
-    return false;
-  }
-  if (!g_i2c_lock) {
-    Serial.println("[Main] sendAllSharedAddresses: i2c lock is null");
     return false;
   }
   if (!sendSharedAddressTo(MSG_SET_SHARED_BMP, BMP280CORE_ID, region.bmp.data)) return false;
@@ -384,31 +433,11 @@ void setup() {
   Serial.println("[Main] setup begin");
 
   MP.begin(BMI160CORE_ID);
-  Serial.println("[Main] MP.begin BMI160 done");
   MP.begin(BMP280CORE_ID);
-  Serial.println("[Main] MP.begin BMP280 done");
   MP.begin(M_IMUCORE_ID);
-  Serial.println("[Main] MP.begin MIMU done");
   MP.RecvTimeout(3000);
-  Serial.println("[Main] waiting subcore ready messages");
-
-  if (!waitSubcoreReady(BMP280CORE_ID, "BMP280Core") ||
-      !waitSubcoreReady(BMI160CORE_ID, "BMI160Core") ||
-      !waitSubcoreReady(M_IMUCORE_ID, "MultiImuCore")) {
-    Serial.println("[Main] setup aborted while waiting subcore ready");
-    return;
-  }
-
-  Serial.println("[Main] all subcores ready");
-  Serial.println("[Main] spinlock allocation is managed by shared layout");
 
   Serial.println("[Main] setup done");
-  return;
-
-FATAL_ERROR_SETUP:
-  while (1) {
-    usleep(1000 * 1000);
-  }
 }
 
 // ------------------------------------------------------------
@@ -417,75 +446,105 @@ FATAL_ERROR_SETUP:
 void loop() {
   static MainState mainState = MAIN_STATE_READY;
   static uint32_t stateEnteredMs = millis();
-  static bool firstLayoutConfigured = false;
-  SharedMemoryLayout next = SHARED_LAYOUT_0;
 
   uint32_t now = millis();
-
-  if (!theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT) &&
-      mainState == MAIN_STATE_RUN) {
-    usleep(1000 * 1000);
-    return;
-  }
 
   if (mainState == MAIN_STATE_RUN) {
     if ((uint32_t)(now - stateEnteredMs) >= MODE_SWITCH_INTERVAL_MS) {
       if (sendStopToAllSubcores()) {
-        if (theAllocator.isAllocated(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
-          if (!theAllocator.free(regionAreas(&g_shared_memory), SHARED_AREA_COUNT)) {
-            Serial.println("[Main] FATAL: shared memory fence check failed on stop");
-            goto FATAL_ERROR;
-          }
-        }
         mainState = MAIN_STATE_READY;
         stateEnteredMs = now;
         Serial.println("[Main] mode=READY");
-        usleep(100 * 1000);
+        delay(100);
       } else {
-        Serial.println("[Main] FATAL: failed to stop subcores");
-        goto FATAL_ERROR;
+        Serial.println("[Main] failed to stop subcores");
       }
     }
   }
 
   if (mainState == MAIN_STATE_READY) {
     if ((uint32_t)(now - stateEnteredMs) >= READY_HOLD_MS) {
-      next = firstLayoutConfigured ? nextLayout(g_active_layout) : SHARED_LAYOUT_2;
+      SharedMemoryLayout next = nextLayout(g_active_layout);
       if (!configureSharedLayout(next)) {
+        delay(100);
         return;
       }
-      firstLayoutConfigured = true;
+
       if (sendStartToAllSubcores()) {
         mainState = MAIN_STATE_RUN;
         stateEnteredMs = now;
         Serial.println("[Main] mode=RUN");
-        usleep(100 * 1000);
+        delay(100);
       } else {
-        Serial.println("[Main] FATAL: failed to start subcores");
-        goto FATAL_ERROR;
+        Serial.println("[Main] failed to start subcores");
       }
     }
     return;
   }
 
   if (g_shared_memory.bmp.data) {
-    float *bmpData = static_cast<float*>(g_shared_memory.bmp.data);
-    printBMP(bmpData);
+    if (g_bmp_mode == BMP280_MODE_PRESS) {
+      auto ring = static_cast<InterCoreRingBuffer<BMP280Press, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmp.data);
+      BMP280Press latest;
+      if (readLatestLocked(ring, &latest)) {
+        printBMP(latest);
+      }
+    } else {
+      auto ring = static_cast<InterCoreRingBuffer<BMP280Full, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmp.data);
+      BMP280Full latest;
+      if (readLatestLocked(ring, &latest)) {
+        printBMP(latest);
+      }
+    }
   }
 
   if (g_shared_memory.bmi.data) {
-    float *bmiData = static_cast<float*>(g_shared_memory.bmi.data);
-    printBMI(bmiData);
+    if (g_bmi_mode == BMI160_MODE_ACC) {
+      auto ring = static_cast<InterCoreRingBuffer<BMI160Acc, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmi.data);
+      BMI160Acc latest;
+      bool hasData = readLatestLocked(ring, &latest);
+      recordBmiDiag(hasData, now);
+      if (hasData) {
+        printBMI(latest);
+      }
+    } else if (g_bmi_mode == BMI160_MODE_GYRO) {
+      auto ring = static_cast<InterCoreRingBuffer<BMI160Gyro, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmi.data);
+      BMI160Gyro latest;
+      bool hasData = readLatestLocked(ring, &latest);
+      recordBmiDiag(hasData, now);
+      if (hasData) {
+        printBMI(latest);
+      }
+    } else {
+      auto ring = static_cast<InterCoreRingBuffer<BMI160Imu, RINGBUFFER_CAPACITY> *>(g_shared_memory.bmi.data);
+      BMI160Imu latest;
+      bool hasData = readLatestLocked(ring, &latest);
+      recordBmiDiag(hasData, now);
+      if (hasData) {
+        printBMI(latest);
+      }
+    }
   }
 
   if (g_shared_memory.mimu.data) {
-    float *mimuData = static_cast<float*>(g_shared_memory.mimu.data);
-    printMIMU(mimuData);
+    if (g_mimu_mode == MIMU_MODE_FULL) {
+      auto ring = static_cast<InterCoreRingBuffer<MIMUFull, RINGBUFFER_CAPACITY> *>(g_shared_memory.mimu.data);
+      MIMUFull latest;
+      bool hasData = readLatestLocked(ring, &latest);
+      recordMimuDiag(hasData, now);
+      if (hasData) {
+        printMIMU(latest);
+      }
+    } else {
+      auto ring = static_cast<InterCoreRingBuffer<MIMURaw, RINGBUFFER_CAPACITY> *>(g_shared_memory.mimu.data);
+      MIMURaw latest;
+      bool hasData = readLatestLocked(ring, &latest);
+      recordMimuDiag(hasData, now);
+      if (hasData) {
+        printMIMU(latest);
+      }
+    }
   }
-  return;
 
-FATAL_ERROR:
-  while (1) {
-    usleep(1000 * 1000);
-  }
+  printDiagIfDue(now);
 }
