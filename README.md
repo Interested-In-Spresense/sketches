@@ -130,6 +130,10 @@ Camera input and image processing sketches
 マルチコア機能を利用したスケッチ\
 Examples using multi-core features
 
+-   `ManySensor/`\
+    複数センサを扱うマルチコアサンプル
+    Multi-core example for handling multiple sensors
+
 -   `SensorSync/`\
     センサデータを複数コアで同期処理\
     Sensor synchronization across cores
@@ -137,6 +141,10 @@ Examples using multi-core features
 -   `ShareI2C/`\
     I2Cを複数コアで共有\
     Shared I2C across cores
+
+-   `SpinLockVerification/`\
+    スピンロックの動作確認用サンプル
+    Spin lock verification example
 
 ------------------------------------------------------------------------
 
